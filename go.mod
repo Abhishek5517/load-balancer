@@ -1,4 +1,4 @@
-module load-balancer
+module github.com/Abhishek5517/load-balancer
 
 go 1.23.4
 
