@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"io"
-	myRedis "load-balancer/RedisClient"
-	"load-balancer/strategies"
 	"log"
 	"net/http"
 	"os"
+
+	"github.com/Abhishek5517/load-balancer/strategies"
+
+	myRedis "github.com/Abhishek5517/load-balancer/RedisClient"
 
 	ratelimiter "github.com/Abhishek5517/Rate-Limiter"
 	"github.com/gofiber/fiber/v2"
