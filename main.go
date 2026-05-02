@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Abhishek5517/load-balancer/strategies"
@@ -18,10 +21,13 @@ import (
 )
 
 var (
-	_        = godotenv.Load()
-	Redis    = myRedis.InitRedis()
-	PORT     = os.Getenv("PORT")
-	STRATEGY = os.Getenv("STRATEGY") // round-robin | least-connection | consistent-hashing | random-server
+	_                   = godotenv.Load()
+	Redis               = myRedis.InitRedis()
+	PORT                = os.Getenv("PORT")
+	STRATEGY            = os.Getenv("STRATEGY") // round-robin | least-connection | consistent-hashing | random-server
+	httpClient          = &http.Client{Timeout: 10 * time.Second}
+	ratelimiterInstance = ratelimiter.NewTokenBucket("global:ratelimit", 1, 1) // 1 request/sec with burst
+	//  of 1
 )
 
 func main() {
@@ -35,7 +41,24 @@ func main() {
 	app.All("*", ClientRequest())
 
 	log.Printf("[config] strategy: %s", strategyName())
-	log.Fatal(app.Listen(PORT))
+	// start server in a goroutine so we can listen for shutdown signals in main thread
+	go func() {
+		if err := app.Listen(":" + PORT); err != nil {
+			log.Fatal("Failed to start server: ", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	// blocks main goroutine until an interrupt signal is received and this will be sent to quit channel, allowing for graceful shutdown
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+	// allow 10 seconds time for in-flight requests to complete before forcefully shutting down
+	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
+		log.Printf("forced shutdown: %v", err)
+	}
+
+	log.Println("shutting down complete")
+
 }
 
 func strategyName() string {
@@ -85,7 +108,7 @@ func ClientRequest() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		ip := c.IP()
 		// token bucket rate limiter: 1 request/sec per IP, burst of 1
-		if !ratelimiter.RateLimit(&Redis, ip, 1, 1, 1) {
+		if !ratelimiterInstance.TokenBucket(&Redis, 1) {
 			return c.Status(429).SendString("Too Many Requests")
 		}
 
@@ -101,7 +124,10 @@ func ClientRequest() fiber.Handler {
 
 		targetURL := targetOrigin + c.OriginalURL()
 
-		req, err := http.NewRequest(c.Method(), targetURL, bytes.NewReader(c.Body()))
+		ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, c.Method(), targetURL, bytes.NewReader(c.Body()))
+
 		if err != nil {
 			return c.Status(500).SendString("Failed to create request: " + err.Error())
 		}
@@ -114,8 +140,7 @@ func ClientRequest() fiber.Handler {
 		errChan := make(chan error)
 
 		go func() {
-			client := &http.Client{}
-			resp, err := client.Do(req)
+			resp, err := httpClient.Do(req)
 			if err != nil {
 				// passive health check: mark server down immediately on failure
 				strategies.DefaultPool.SetHealth(targetOrigin, false)
